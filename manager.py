@@ -23,7 +23,7 @@ import threading
 import time
 from typing import Dict, Any, Optional, List
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, selectinload
 
 from .models import (
@@ -51,6 +51,7 @@ from .builder import LLMBuilderMixin
 from .credit_services import CreditServicesMixin
 from .quota_services import QuotaServicesMixin
 from .usage_services import UsageServicesMixin
+from .redeem_code_services import RedeemCodeServicesMixin
 from .utils import probe_platform_models, test_platform_chat, stream_speed_test, test_platform_embedding
 
 
@@ -95,15 +96,152 @@ class AIManagerBase:
         self._sys_platforms_cache_ttl = float(os.getenv("LLM_SYS_PLATFORM_CACHE_TTL", "5"))
         self.use_sys_llm_config = USE_SYS_LLM_CONFIG
         self.llm_auto_key = LLM_AUTO_KEY
+        self.billing_enabled = False
         self._default_platform_id = None
         self._default_model_id = None
         self._builtin_usage_map = {slot["key"]: slot for slot in BUILTIN_USAGE_SLOTS}
         self._default_usage_key = DEFAULT_USAGE_KEY
+        self._sys_platform_keys_constraint_checked = False
         
         state_file_path = get_state_file_path()
         state_file_path.parent.mkdir(parents=True, exist_ok=True)
         self.state_file = str(state_file_path)
         self._load_state()
+
+    def _has_sys_platform_keys_composite_unique(self, conn) -> bool:
+        """检测 llm_sys_platform_keys 是否具备 (user_id, platform_id) 复合唯一约束。"""
+        index_rows = conn.execute(text("PRAGMA index_list('llm_sys_platform_keys')")).fetchall()
+        for row in index_rows:
+            if len(row) < 3:
+                continue
+            index_name = row[1]
+            unique_flag = int(row[2])
+            if unique_flag != 1 or not index_name:
+                continue
+
+            safe_index_name = str(index_name).replace("'", "''")
+            col_rows = conn.execute(text(f"PRAGMA index_info('{safe_index_name}')")).fetchall()
+            cols = [str(c[2]) for c in col_rows if len(c) >= 3]
+            if len(cols) == 2 and set(cols) == {"user_id", "platform_id"}:
+                return True
+
+        return False
+
+    def _repair_sys_platform_keys_unique_constraint(self, conn) -> None:
+        """修复历史数据库中 llm_sys_platform_keys 缺失复合唯一约束的问题。"""
+        print("[启动修复] 检测到 llm_sys_platform_keys 缺少(user_id, platform_id)唯一约束，开始自动修复")
+
+        rows = conn.execute(
+            text(
+                """
+                SELECT id, user_id, platform_id, api_key, disable
+                FROM llm_sys_platform_keys
+                ORDER BY id ASC
+                """
+            )
+        ).mappings().all()
+
+        deduped: Dict[tuple, Dict[str, Any]] = {}
+        for row in rows:
+            user_id = str(row["user_id"] or "")
+            platform_id = int(row["platform_id"])
+            candidate = {
+                "id": int(row["id"]),
+                "user_id": user_id,
+                "platform_id": platform_id,
+                "api_key": row["api_key"],
+                "disable": int(row["disable"] or 0),
+            }
+
+            key = (user_id, platform_id)
+            existing = deduped.get(key)
+            if existing is None:
+                deduped[key] = candidate
+                continue
+
+            # 同一 user+platform 出现重复历史脏数据时：优先保留有 key 的记录，其次保留最新 id。
+            existing_has_key = bool(existing.get("api_key"))
+            candidate_has_key = bool(candidate.get("api_key"))
+            if (not existing_has_key and candidate_has_key) or (
+                existing_has_key == candidate_has_key and candidate["id"] > existing["id"]
+            ):
+                deduped[key] = candidate
+
+        conn.execute(text("DROP TABLE IF EXISTS llm_sys_platform_keys__rebuild"))
+        conn.execute(
+            text(
+                """
+                CREATE TABLE llm_sys_platform_keys__rebuild (
+                    id INTEGER PRIMARY KEY,
+                    user_id VARCHAR(255) NOT NULL,
+                    platform_id INTEGER NOT NULL,
+                    api_key VARCHAR(512),
+                    disable INTEGER DEFAULT 0,
+                    FOREIGN KEY(platform_id) REFERENCES llm_platforms(id) ON DELETE CASCADE,
+                    CONSTRAINT uq_sys_platform_key_user_platform UNIQUE (user_id, platform_id)
+                )
+                """
+            )
+        )
+
+        if deduped:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO llm_sys_platform_keys__rebuild (id, user_id, platform_id, api_key, disable)
+                    VALUES (:id, :user_id, :platform_id, :api_key, :disable)
+                    """
+                ),
+                list(deduped.values()),
+            )
+
+        conn.execute(text("DROP TABLE llm_sys_platform_keys"))
+        conn.execute(text("ALTER TABLE llm_sys_platform_keys__rebuild RENAME TO llm_sys_platform_keys"))
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_llm_sys_platform_keys_user_id "
+                "ON llm_sys_platform_keys (user_id)"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_llm_sys_platform_keys_platform_id "
+                "ON llm_sys_platform_keys (platform_id)"
+            )
+        )
+        print("[启动修复] llm_sys_platform_keys 约束修复完成")
+
+    def _ensure_sys_platform_keys_unique_constraint(self, force: bool = False) -> None:
+        """确保系统平台用户密钥表具备 (user_id, platform_id) 复合唯一约束。"""
+        if self._sys_platform_keys_constraint_checked and not force:
+            return
+
+        if self.engine.dialect.name != "sqlite":
+            self._sys_platform_keys_constraint_checked = True
+            return
+
+        with self.engine.begin() as conn:
+            table_exists = conn.execute(
+                text(
+                    """
+                    SELECT 1 FROM sqlite_master
+                    WHERE type='table' AND name='llm_sys_platform_keys'
+                    LIMIT 1
+                    """
+                )
+            ).first()
+
+            if not table_exists:
+                self._sys_platform_keys_constraint_checked = True
+                return
+
+            if self._has_sys_platform_keys_composite_unique(conn):
+                self._sys_platform_keys_constraint_checked = True
+                return
+
+            self._repair_sys_platform_keys_unique_constraint(conn)
+
+        self._sys_platform_keys_constraint_checked = True
 
     def _load_state(self):
         """加载运行时状态"""
@@ -116,6 +254,8 @@ class AIManagerBase:
                         self.use_sys_llm_config = state["use_sys_llm_config"]
                     if "llm_auto_key" in state:
                         self.llm_auto_key = state["llm_auto_key"]
+                    if "billing_enabled" in state:
+                        self.billing_enabled = bool(state["billing_enabled"])
             except Exception as e:
                 print(f"加载状态失败: {e}")
 
@@ -124,7 +264,8 @@ class AIManagerBase:
         try:
             state = {
                 "use_sys_llm_config": self.use_sys_llm_config,
-                "llm_auto_key": self.llm_auto_key
+                "llm_auto_key": self.llm_auto_key,
+                "billing_enabled": self.billing_enabled,
             }
             with open(self.state_file, 'w', encoding='utf-8') as f:
                 json.dump(state, f, indent=2)
@@ -140,39 +281,49 @@ class AIManagerBase:
         self.ensure_database_schema()
         self.initialize_defaults(ensure_schema=False)
 
+    def _resolve_default_ids_from_db(self, session) -> None:
+        """从数据库 sort_order 确定默认平台 ID 和默认模型 ID。
+
+        优先级：
+        1. 数据库中 sort_order 最小的未禁用系统平台
+        2. 该平台内 sort_order 最小的未禁用非 Embedding 模型
+        """
+        from sqlalchemy.orm import selectinload
+
+        default_plat = (
+            session.query(LLMPlatform)
+            .options(selectinload(LLMPlatform.models))
+            .filter_by(is_sys=1, disable=0)
+            .order_by(LLMPlatform.sort_order)
+            .first()
+        )
+        if not default_plat:
+            raise RuntimeError("数据库中没有可用的系统平台")
+
+        self._default_platform_id = default_plat.id
+
+        sorted_models = sorted(default_plat.models, key=lambda m: m.sort_order)
+        default_model = next(
+            (m for m in sorted_models if not m.is_embedding and not self._is_model_disabled(m)),
+            None,
+        )
+        if not default_model:
+            raise RuntimeError(f"默认平台 '{default_plat.name}' 没有可用的 LLM 模型")
+
+        self._default_model_id = default_model.id
+
     def initialize_defaults(self, ensure_schema: bool = True):
         """同步默认平台并初始化默认ID"""
         if ensure_schema:
             self.ensure_database_schema()
 
+        self._ensure_sys_platform_keys_unique_constraint()
+
         self._sync_default_platforms()
-        
+
         with self.Session() as session:
-            default_platform_name = next(iter(DEFAULT_PLATFORM_CONFIGS))
-            default_platform_config = DEFAULT_PLATFORM_CONFIGS[default_platform_name]
-            default_model_display_name = None
-            for display_name, model_cfg in default_platform_config.get("models", {}).items():
-                if isinstance(model_cfg, dict) and model_cfg.get("is_embedding"):
-                    continue
-                default_model_display_name = display_name
-                break
-            if not default_model_display_name:
-                raise ValueError("默认平台未配置可用的 LLM 模型")
-            
-            default_plat = session.query(LLMPlatform).filter_by(name=default_platform_name, is_sys=1).first()
-            if default_plat:
-                self._default_platform_id = default_plat.id
-                default_model = session.query(LLModels).filter_by(
-                    platform_id=default_plat.id, 
-                    display_name=default_model_display_name
-                ).first()
-                if default_model:
-                    self._default_model_id = default_model.id
-                else:
-                    raise ValueError(f"默认模型 '{default_model_display_name}' 未找到")
-            else:
-                raise ValueError(f"默认平台 '{default_platform_name}' 未找到")
-        
+            self._resolve_default_ids_from_db(session)
+
         with self.Session() as session:
             self.ensure_user_has_config(session, SYSTEM_USER_ID)
 
@@ -221,7 +372,7 @@ class AIManagerBase:
                     plain_result = sec_mgr.decrypt(raw_value)
                     if plain_result.has_plaintext:
                         return sec_mgr.encrypt(plain_result.value)
-                print("[初始化] 跳过不可解密的 YAML 托管 Key（当前环境无法解开该 ENC 值，将保留平台/模型结构但不导入 Key）")
+                print("[初始化] YAML 托管 Key 与当前站点主密钥不匹配，该平台需要配置 API Key（将保留平台/模型结构但不导入 Key）")
                 return None
 
             if not sec_mgr.has_active_key():
@@ -266,12 +417,12 @@ class AIManagerBase:
                         plat.disable = 1
                 session.flush()
             
-            for name, cfg in raw_platform_configs.items():
+            for plat_idx, (name, cfg) in enumerate(raw_platform_configs.items()):
                 if not isinstance(cfg, dict) or "base_url" not in cfg:
                     continue
                 base_url = cfg["base_url"]
                 plat = session.query(LLMPlatform).filter_by(base_url=base_url, is_sys=1).first()
-                
+
                 if not plat and base_url not in disabled_base_urls:
                     # 新平台：添加到数据库（跳过已被管理员禁用的）
                     encrypted_key = _prepare_seed_api_key(cfg.get("api_key"))
@@ -281,13 +432,14 @@ class AIManagerBase:
                         api_key=encrypted_key,  # YAML 中若有密钥则加密写入
                         user_id=SYSTEM_USER_ID,
                         is_sys=1,
+                        sort_order=plat_idx,
                     )
                     session.add(plat)
                     session.flush()
                     print(f"[初始化] 添加新系统平台: {name}")
-                    
+
                     # 新平台：添加所有模型
-                    for display_name, model_config in cfg.get("models", {}).items():
+                    for model_idx, (display_name, model_config) in enumerate(cfg.get("models", {}).items()):
                         if isinstance(model_config, str):
                             model_name = model_config
                             extra_body = None
@@ -310,23 +462,27 @@ class AIManagerBase:
                             max_context_tokens=max_context_tokens,
                             max_output_tokens=max_output_tokens,
                             is_embedding=is_embedding,
+                            sort_order=model_idx,
                         )
                         session.add(new_model)
-                
+
                 elif force_reset or is_first_init:
                     # 强制重置或首次初始化：更新平台名称和同步模型
                     if plat.name != name:
                         print(f"[YAML重置] 恢复系统平台名称: {plat.name} -> {name}")
                         plat.name = name
 
+                    # 按 YAML 顺序同步 sort_order
+                    plat.sort_order = plat_idx
+
                     # 若 YAML 提供 API Key，则更新平台默认 Key（加密写入）
                     encrypted_key = _prepare_seed_api_key(cfg.get("api_key"))
                     if encrypted_key:
                         plat.api_key = encrypted_key
-                    
-                    # 同步模型（覆盖模式）
-                    existing_models = {m.display_name: m for m in plat.models}
-                    for display_name, model_config in cfg.get("models", {}).items():
+
+                    # 1. 解析 YAML 中该平台的所有模型配置
+                    yaml_models_to_match = []
+                    for model_idx, (display_name, model_config) in enumerate(cfg.get("models", {}).items()):
                         if isinstance(model_config, str):
                             model_name = model_config
                             extra_body = None
@@ -338,24 +494,118 @@ class AIManagerBase:
                             temperature = model_config.get("temperature")
                             is_embedding = 1 if model_config.get("is_embedding") else 0
                         max_context_tokens, max_output_tokens = _resolve_model_limits(model_config)
-
                         extra_body_json = json.dumps(extra_body) if extra_body else None
 
-                        if display_name in existing_models:
-                            model_to_update = existing_models[display_name]
-                            if model_to_update.model_name != model_name:
-                                model_to_update.model_name = model_name
+                        yaml_models_to_match.append({
+                            "display_name": display_name,
+                            "model_name": model_name,
+                            "is_embedding": is_embedding,
+                            "extra_body_json": extra_body_json,
+                            "temperature": temperature,
+                            "max_context_tokens": max_context_tokens,
+                            "max_output_tokens": max_output_tokens,
+                            "sort_order": model_idx,
+                        })
+
+                    # 2. 执行多阶段精密匹配算法，关联 YAML 模型配置与数据库已存模型
+                    db_models_pool = list(plat.models)
+                    matched_pairs = {}  # yaml_model_index -> db_model
+                    matched_db_ids = set()
+
+                    # 第一阶段：完美匹配 (display_name, model_name, is_embedding)
+                    for idx, y_m in enumerate(yaml_models_to_match):
+                        for db_m in db_models_pool:
+                            if db_m.id in matched_db_ids:
+                                continue
+                            if (
+                                db_m.display_name == y_m["display_name"]
+                                and db_m.model_name == y_m["model_name"]
+                                and db_m.is_embedding == y_m["is_embedding"]
+                            ):
+                                matched_pairs[idx] = db_m
+                                matched_db_ids.add(db_m.id)
+                                break
+
+                    # 第二阶段：同名同类别匹配 (display_name, is_embedding)，允许 model_name 改动
+                    for idx, y_m in enumerate(yaml_models_to_match):
+                        if idx in matched_pairs:
+                            continue
+                        for db_m in db_models_pool:
+                            if db_m.id in matched_db_ids:
+                                continue
+                            if (
+                                db_m.display_name == y_m["display_name"]
+                                and db_m.is_embedding == y_m["is_embedding"]
+                            ):
+                                matched_pairs[idx] = db_m
+                                matched_db_ids.add(db_m.id)
+                                break
+
+                    # 第三阶段：唯一标识改名匹配（仅在 (model_name, is_embedding) 于当前平台内唯一时适用）
+                    from collections import Counter
+                    yaml_keys_counter = Counter((y["model_name"], y["is_embedding"]) for y in yaml_models_to_match)
+                    
+                    for idx, y_m in enumerate(yaml_models_to_match):
+                        if idx in matched_pairs:
+                            continue
+                        key = (y_m["model_name"], y_m["is_embedding"])
+                        if yaml_keys_counter[key] == 1:
+                            candidates = [
+                                db_m for db_m in db_models_pool
+                                if db_m.id not in matched_db_ids
+                                and db_m.model_name == y_m["model_name"]
+                                and db_m.is_embedding == y_m["is_embedding"]
+                            ]
+                            if len(candidates) == 1:
+                                db_m = candidates[0]
+                                matched_pairs[idx] = db_m
+                                matched_db_ids.add(db_m.id)
+
+                    # 第四阶段：同 model_name 根据 extra_body 匹配（解决相同 model_name 多配置的改名更新匹配）
+                    for idx, y_m in enumerate(yaml_models_to_match):
+                        if idx in matched_pairs:
+                            continue
+                        key = (y_m["model_name"], y_m["is_embedding"])
+                        candidates = [
+                            db_m for db_m in db_models_pool
+                            if db_m.id not in matched_db_ids
+                            and db_m.model_name == y_m["model_name"]
+                            and db_m.is_embedding == y_m["is_embedding"]
+                        ]
+                        if candidates:
+                            best_match = None
+                            for cand in candidates:
+                                if cand.extra_body == y_m["extra_body_json"]:
+                                    best_match = cand
+                                    break
+                            if best_match:
+                                matched_pairs[idx] = best_match
+                                matched_db_ids.add(best_match.id)
+
+                    # 3. 首次初始化或强制重置：同步配置，并删除已废弃模型
+                    for idx, y_m in enumerate(yaml_models_to_match):
+                        display_name = y_m["display_name"]
+                        model_name = y_m["model_name"]
+                        extra_body_json = y_m["extra_body_json"]
+                        temperature = y_m["temperature"]
+                        max_context_tokens = y_m["max_context_tokens"]
+                        max_output_tokens = y_m["max_output_tokens"]
+                        model_idx = y_m["sort_order"]
+
+                        if idx in matched_pairs:
+                            model_to_update = matched_pairs[idx]
+                            if model_to_update.display_name != display_name:
+                                print(f"[YAML重置] 平台 {name} 模型显示名称变更: {model_to_update.display_name} -> {display_name}")
+                                model_to_update.display_name = display_name
                             if model_to_update.extra_body != extra_body_json:
                                 model_to_update.extra_body = extra_body_json
                             if model_to_update.temperature != temperature:
                                 model_to_update.temperature = temperature
-                            if model_to_update.is_embedding != is_embedding:
-                                model_to_update.is_embedding = is_embedding
                             if model_to_update.max_context_tokens != max_context_tokens:
                                 model_to_update.max_context_tokens = max_context_tokens
                             if model_to_update.max_output_tokens != max_output_tokens:
                                 model_to_update.max_output_tokens = max_output_tokens
-                            del existing_models[display_name]
+                            model_to_update.sort_order = model_idx
                         else:
                             new_model = LLModels(
                                 platform_id=plat.id,
@@ -365,33 +615,153 @@ class AIManagerBase:
                                 temperature=temperature,
                                 max_context_tokens=max_context_tokens,
                                 max_output_tokens=max_output_tokens,
-                                is_embedding=is_embedding,
+                                is_embedding=y_m["is_embedding"],
+                                sort_order=model_idx,
                             )
                             session.add(new_model)
-                    
-                    # 删除 YAML 中已移除的模型
-                    for model_to_delete in existing_models.values():
-                        session.delete(model_to_delete)
+                            print(f"[YAML重置] 平台 {name} 新增模型: {display_name} ({model_name})")
+
+                    # 删除已在 YAML 中废弃（未匹配到）的系统模型
+                    for db_m in db_models_pool:
+                        if db_m.id not in matched_db_ids:
+                            session.delete(db_m)
+                            print(f"[YAML重置] 平台 {name} 删除已废弃模型: {db_m.display_name}")
                 
                 else:
-                    # 正常启动模式：已存在的平台不做任何修改
-                    # 仅添加 YAML 中新增的模型（不覆盖已有模型）
-                    existing_model_names = {m.display_name for m in plat.models}
-                    for display_name, model_config in cfg.get("models", {}).items():
-                        if display_name not in existing_model_names:
-                            if isinstance(model_config, str):
-                                model_name = model_config
-                                extra_body = None
-                                temperature = None
-                                is_embedding = 0
-                            else:
-                                model_name = model_config.get("model_name")
-                                extra_body = model_config.get("extra_body")
-                                temperature = model_config.get("temperature")
-                                is_embedding = 1 if model_config.get("is_embedding") else 0
-                            max_context_tokens, max_output_tokens = _resolve_model_limits(model_config)
-                            
-                            extra_body_json = json.dumps(extra_body) if extra_body else None
+                    # 正常启动增量更新模式：
+                    # 自动同步平台名称（若有变动）
+                    if plat.name != name:
+                        print(f"[增量同步] 更新系统平台名称: {plat.name} -> {name}")
+                        plat.name = name
+
+                    # 1. 解析 YAML 中该平台的所有模型配置
+                    yaml_models_to_match = []
+                    for model_idx, (display_name, model_config) in enumerate(cfg.get("models", {}).items()):
+                        if isinstance(model_config, str):
+                            model_name = model_config
+                            extra_body = None
+                            temperature = None
+                            is_embedding = 0
+                        else:
+                            model_name = model_config.get("model_name")
+                            extra_body = model_config.get("extra_body")
+                            temperature = model_config.get("temperature")
+                            is_embedding = 1 if model_config.get("is_embedding") else 0
+                        max_context_tokens, max_output_tokens = _resolve_model_limits(model_config)
+                        extra_body_json = json.dumps(extra_body) if extra_body else None
+
+                        yaml_models_to_match.append({
+                            "display_name": display_name,
+                            "model_name": model_name,
+                            "is_embedding": is_embedding,
+                            "extra_body_json": extra_body_json,
+                            "temperature": temperature,
+                            "max_context_tokens": max_context_tokens,
+                            "max_output_tokens": max_output_tokens,
+                            "sort_order": model_idx,
+                        })
+
+                    # 2. 执行多阶段精密匹配算法，关联 YAML 模型配置与数据库已存模型
+                    db_models_pool = list(plat.models)
+                    matched_pairs = {}  # yaml_model_index -> db_model
+                    matched_db_ids = set()
+
+                    # 第一阶段：完美匹配 (display_name, model_name, is_embedding)
+                    for idx, y_m in enumerate(yaml_models_to_match):
+                        for db_m in db_models_pool:
+                            if db_m.id in matched_db_ids:
+                                continue
+                            if (
+                                db_m.display_name == y_m["display_name"]
+                                and db_m.model_name == y_m["model_name"]
+                                and db_m.is_embedding == y_m["is_embedding"]
+                            ):
+                                matched_pairs[idx] = db_m
+                                matched_db_ids.add(db_m.id)
+                                break
+
+                    # 第二阶段：同名同类别匹配 (display_name, is_embedding)，允许 model_name 改动
+                    for idx, y_m in enumerate(yaml_models_to_match):
+                        if idx in matched_pairs:
+                            continue
+                        for db_m in db_models_pool:
+                            if db_m.id in matched_db_ids:
+                                continue
+                            if (
+                                db_m.display_name == y_m["display_name"]
+                                and db_m.is_embedding == y_m["is_embedding"]
+                            ):
+                                matched_pairs[idx] = db_m
+                                matched_db_ids.add(db_m.id)
+                                break
+
+                    # 第三阶段：唯一标识改名匹配（仅在 (model_name, is_embedding) 于当前平台内唯一时适用）
+                    from collections import Counter
+                    yaml_keys_counter = Counter((y["model_name"], y["is_embedding"]) for y in yaml_models_to_match)
+                    
+                    for idx, y_m in enumerate(yaml_models_to_match):
+                        if idx in matched_pairs:
+                            continue
+                        key = (y_m["model_name"], y_m["is_embedding"])
+                        if yaml_keys_counter[key] == 1:
+                            candidates = [
+                                db_m for db_m in db_models_pool
+                                if db_m.id not in matched_db_ids
+                                and db_m.model_name == y_m["model_name"]
+                                and db_m.is_embedding == y_m["is_embedding"]
+                            ]
+                            if len(candidates) == 1:
+                                db_m = candidates[0]
+                                matched_pairs[idx] = db_m
+                                matched_db_ids.add(db_m.id)
+
+                    # 第四阶段：同 model_name 根据 extra_body 匹配（解决相同 model_name 多配置的改名更新匹配）
+                    for idx, y_m in enumerate(yaml_models_to_match):
+                        if idx in matched_pairs:
+                            continue
+                        key = (y_m["model_name"], y_m["is_embedding"])
+                        candidates = [
+                            db_m for db_m in db_models_pool
+                            if db_m.id not in matched_db_ids
+                            and db_m.model_name == y_m["model_name"]
+                            and db_m.is_embedding == y_m["is_embedding"]
+                        ]
+                        if candidates:
+                            best_match = None
+                            for cand in candidates:
+                                if cand.extra_body == y_m["extra_body_json"]:
+                                    best_match = cand
+                                    break
+                            if best_match:
+                                matched_pairs[idx] = best_match
+                                matched_db_ids.add(best_match.id)
+
+                    # 3. 正常启动增量更新模式：同步配置且新增，不删除自定义模型
+                    max_sort = max((m.sort_order or 0 for m in plat.models), default=-1)
+
+                    for idx, y_m in enumerate(yaml_models_to_match):
+                        display_name = y_m["display_name"]
+                        model_name = y_m["model_name"]
+                        extra_body_json = y_m["extra_body_json"]
+                        temperature = y_m["temperature"]
+                        max_context_tokens = y_m["max_context_tokens"]
+                        max_output_tokens = y_m["max_output_tokens"]
+
+                        if idx in matched_pairs:
+                            model_to_update = matched_pairs[idx]
+                            if model_to_update.display_name != display_name:
+                                print(f"[增量同步] 平台 {name} 模型显示名称自动更新: {model_to_update.display_name} -> {display_name}")
+                                model_to_update.display_name = display_name
+                            if model_to_update.extra_body != extra_body_json:
+                                model_to_update.extra_body = extra_body_json
+                            if model_to_update.temperature != temperature:
+                                model_to_update.temperature = temperature
+                            if model_to_update.max_context_tokens != max_context_tokens:
+                                model_to_update.max_context_tokens = max_context_tokens
+                            if model_to_update.max_output_tokens != max_output_tokens:
+                                model_to_update.max_output_tokens = max_output_tokens
+                        else:
+                            max_sort += 1
                             new_model = LLModels(
                                 platform_id=plat.id,
                                 model_name=model_name,
@@ -400,7 +770,8 @@ class AIManagerBase:
                                 temperature=temperature,
                                 max_context_tokens=max_context_tokens,
                                 max_output_tokens=max_output_tokens,
-                                is_embedding=is_embedding,
+                                is_embedding=y_m["is_embedding"],
+                                sort_order=max_sort,
                             )
                             session.add(new_model)
                             print(f"[增量同步] 平台 {name} 添加新模型: {display_name}")
@@ -436,13 +807,11 @@ class AIManagerBase:
 
         decrypted_with_new = SecurityManager.decrypt_with_key(text, new_key)
         if decrypted_with_new.has_plaintext:
-            normalized = SecurityManager.encrypt_with_key(decrypted_with_new.value, new_key)
-            return {
-                "action": "write",
-                "value": normalized,
-                "changed": normalized != text,
-                "summary": "normalized_existing" if normalized != text else None,
-            }
+            # Fernet 每次加密都会引入随机因子，
+            # 同一明文在同一主密钥下也会生成不同密文。
+            # 若当前密文已可被新主密钥解密，则视为有效，不做重写，
+            # 避免 GUI 启动时产生无意义的 YAML/DB 脏变更。
+            return {"action": "skip", "value": text, "changed": False, "summary": None}
         
         if old_key:
             decrypted_with_old = SecurityManager.decrypt_with_key(text, old_key)
@@ -612,6 +981,7 @@ class AIManagerBase:
                 session.query(LLMPlatform)
                 .options(selectinload(LLMPlatform.models))
                 .filter_by(is_sys=1)
+                .order_by(LLMPlatform.sort_order)
                 .all()
             )
 
@@ -628,7 +998,7 @@ class AIManagerBase:
                 if plat.api_key:
                     plat_config["api_key"] = plat.api_key
 
-                for model in plat.models:
+                for model in sorted(plat.models, key=lambda m: m.sort_order):
                     if self._is_model_disabled(model):
                         continue
 
@@ -654,6 +1024,10 @@ class AIManagerBase:
                             entry["max_output_tokens"] = int(model.max_output_tokens or DEFAULT_MAX_OUTPUT_TOKENS)
                         if model.is_embedding:
                             entry["is_embedding"] = True
+                        if model.sys_credit_input_price_per_million is not None:
+                            entry["sys_credit_input_price_per_million"] = model.sys_credit_input_price_per_million
+                        if model.sys_credit_output_price_per_million is not None:
+                            entry["sys_credit_output_price_per_million"] = model.sys_credit_output_price_per_million
                         plat_config["models"][model.display_name] = entry
 
                 export_data[plat.name] = plat_config
@@ -702,8 +1076,8 @@ class AIManagerBase:
                     )
                     self._sys_platforms_cache_at = time.time()
 
-    def _ensure_mutable(self):
-        if self.use_sys_llm_config:
+    def _ensure_mutable(self, admin_mode: bool = False):
+        if self.use_sys_llm_config and not admin_mode:
             raise ValueError("当前处于 USE_SYS_LLM_CONFIG 模式，请直接修改 DEFAULT_PLATFORM_CONFIGS 或环境变量。")
 
     @staticmethod
@@ -861,8 +1235,8 @@ class AIManagerBase:
 
         return main_slot
 
-    def proxy_list_models(self, user_id: str, platform_id: int) -> List[str]:
-        """代理调用远程平台获取模型列表"""
+    def proxy_list_models(self, user_id: str, platform_id: int) -> List[Dict[str, Any]]:
+        """代理调用远程平台获取模型列表（含 token 上限信息）"""
         user_id = str(user_id)
         with self.Session() as session:
             plat = session.query(LLMPlatform).filter_by(id=platform_id).first()
@@ -885,12 +1259,20 @@ class AIManagerBase:
         # 调用 utils 中的通用探测逻辑
         try:
             models_data = probe_platform_models(base_url, api_key, raise_on_error=True)
-            return [m["id"] for m in models_data]
+            # 返回含 token 上限的富数据，供前端自动填充
+            return [
+                {
+                    "id": m["id"],
+                    "max_context_tokens": m.get("max_context_tokens"),
+                    "max_output_tokens": m.get("max_output_tokens"),
+                }
+                for m in models_data
+            ]
         except Exception as e:
             raise ValueError(f"获取模型列表失败: {e}")
 
     def proxy_test_chat(self, user_id: str, platform_id: int, model_name: str, extra_body_override: Dict[str, Any] = None) -> str:
-        """测试模型连接 (发送简单的 Hello)"""
+        """测试模型连接（发送固定连通性探测语句）"""
         user_id = str(user_id)
         extra_body = extra_body_override
         with self.Session() as session:
@@ -985,10 +1367,16 @@ class AIManagerBase:
         """获取系统级配置 (LLM_AUTO_KEY, USE_SYS_LLM_CONFIG)"""
         return {
             "llm_auto_key": self.llm_auto_key,
-            "use_sys_llm_config": self.use_sys_llm_config
+            "use_sys_llm_config": self.use_sys_llm_config,
+            "billing_enabled": self.billing_enabled,
         }
 
-    def set_system_config(self, use_sys_llm_config: bool = None, llm_auto_key: bool = None) -> bool:
+    def set_system_config(
+        self,
+        use_sys_llm_config: bool = None,
+        llm_auto_key: bool = None,
+        billing_enabled: bool = None,
+    ) -> bool:
         """设置系统级配置"""
         changed = False
         if use_sys_llm_config is not None:
@@ -999,6 +1387,12 @@ class AIManagerBase:
         if llm_auto_key is not None:
             if self.llm_auto_key != llm_auto_key:
                 self.llm_auto_key = llm_auto_key
+                changed = True
+
+        if billing_enabled is not None:
+            next_billing_enabled = bool(billing_enabled)
+            if self.billing_enabled != next_billing_enabled:
+                self.billing_enabled = next_billing_enabled
                 changed = True
         
         if changed:
@@ -1017,6 +1411,7 @@ class AIManager(
     CreditServicesMixin,
     QuotaServicesMixin,
     UsageServicesMixin,
+    RedeemCodeServicesMixin,
 ):
     """
     AI 模型管理器
