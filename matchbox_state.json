@@ -1,5 +1,5 @@
 {
   "use_sys_llm_config": false,
   "llm_auto_key": true,
-  "billing_enabled": true
+  "billing_enabled": false
 }
